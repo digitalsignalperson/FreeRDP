@@ -79,6 +79,7 @@ static BOOL register_input_events(xfContext* xfc, Window window)
 	WINPR_ASSERT(settings);
 
 	XIDeviceInfo* info = XIQueryDevice(xfc->display, XIAllDevices, &ndevices);
+	xfc->num_pens = 0;
 
 	for (int i = 0; i < MIN(ndevices, 64); i++)
 	{
@@ -125,8 +126,39 @@ static BOOL register_input_events(xfContext* xfc, Window window)
 					XISetMask(masks[nmasks], XI_ButtonRelease);
 					XISetMask(masks[nmasks], XI_Motion);
 					used = TRUE;
+					break;
 				}
-				break;
+				case XIValuatorClass:
+				{
+					const XIValuatorClassInfo* t = (const XIValuatorClassInfo*)class;
+					char *name = t->label ?  XGetAtomName(xfc->display, t->label) : NULL;
+
+					WLog_DBG(TAG, "%s device (id: %d) valuator %d label %s range %f - %f", dev->name, dev->deviceid,
+					    	t->number, name ? name : "None", t->min, t->max);
+
+					// if (strstr(name, "Pressure"))
+					if (t->number == 2) // other implementations always go by index. would name be better?
+					{
+						int max_pressure = t->max;
+						if (strstr(dev->name, "Stylus Pen") || strstr(dev->name, "Pen Pen"))
+						{
+							xfc->pens[xfc->num_pens].deviceid = dev->deviceid;
+							xfc->pens[xfc->num_pens].is_eraser = FALSE;
+							xfc->pens[xfc->num_pens].max_pressure = max_pressure;
+							xfc->num_pens++;
+							WLog_DBG(TAG, "registered pen");
+						}
+						else if (strstr(dev->name, "Stylus Eraser") || strstr(dev->name, "Pen Eraser"))
+						{
+							xfc->pens[xfc->num_pens].deviceid = dev->deviceid;
+							xfc->pens[xfc->num_pens].is_eraser = TRUE;
+							xfc->pens[xfc->num_pens].max_pressure = max_pressure;
+							xfc->num_pens++;
+							WLog_DBG(TAG, "registered eraser");
+						}
+					}
+					break;
+				}
 				default:
 					break;
 			}
@@ -620,6 +652,55 @@ static int xf_input_touch_remote(xfContext* xfc, XIDeviceEvent* event, int evtyp
 	return 0;
 }
 
+static int xf_input_pen_remote(xfContext* xfc, XIDeviceEvent* event, int evtype, int max_pressure, BOOL is_eraser)
+{
+	int x, y;
+	int touchId;
+	RdpeiClientContext* rdpei = xfc->common.rdpei;
+
+	if (!rdpei)
+		return 0;
+
+	xf_input_hide_cursor(xfc);
+	touchId = event->detail; // maybe deviceid?
+	x = (int)event->event_x;
+	y = (int)event->event_y;
+	xf_event_adjust_coordinates(xfc, &x, &y);
+
+	double pressure = 0.0;
+	double* val = event->valuators.values;
+	for (int i = 0; i < MIN(event->valuators.mask_len * 8, 3); i++)
+	{
+		if (XIMaskIsSet(event->valuators.mask, i))
+		{
+			double value = *val++;
+			if (i == 2)
+				pressure =  value;
+		}
+	}
+	WLog_DBG(TAG, "pen pressure %f", pressure);
+	// Try scaling pressure to max 1024 for rdpei? Unclear what range it needs. Touch pressure implied wanted max 1024.
+	// pressure = pressure * 1024.0 / max_pressure;
+
+	int pen_flag = is_eraser ? FREERDP_PEN_ERASER : FREERDP_PEN_PEN;
+	switch (evtype)
+	{
+		case XI_ButtonPress:
+			freerdp_client_handle_touch(&xfc->common, FREERDP_TOUCH_DOWN | pen_flag , touchId, (int)pressure, x, y);
+			break;
+		case XI_Motion:
+			freerdp_client_handle_touch(&xfc->common, FREERDP_TOUCH_MOTION | pen_flag, touchId, (int)pressure, x, y);
+			break;
+		case XI_ButtonRelease:
+			freerdp_client_handle_touch(&xfc->common, FREERDP_TOUCH_UP | pen_flag, touchId, (int)pressure, x, y);
+			break;
+		default:
+			break;
+	}
+
+	return 0;
+}
+
 int xf_input_event(xfContext* xfc, const XEvent* xevent, XIDeviceEvent* event, int evtype)
 {
 	const rdpSettings* settings;
@@ -713,9 +794,32 @@ static int xf_input_handle_event_remote(xfContext* xfc, const XEvent* event)
 			case XI_TouchBegin:
 			case XI_TouchUpdate:
 			case XI_TouchEnd:
+				WLog_DBG(TAG, "handling touch");
 				xf_input_touch_remote(xfc, cookie.cc->data, cookie.cc->evtype);
 				break;
-
+			case XI_ButtonPress:
+			case XI_Motion:
+			case XI_ButtonRelease:
+			{
+				WLog_DBG(TAG, "checking for pen");
+				XIDeviceEvent* deviceEvent = (XIDeviceEvent*)cookie.cc->data;
+				int deviceid = deviceEvent->deviceid;
+				bool used = FALSE;
+				for (int i = 0; i < xfc->num_pens; i++ )
+				{
+					if (xfc->pens[i].deviceid == deviceid)
+					{
+						WLog_DBG(TAG, "pen found");
+						int max_pressure = xfc->pens[i].max_pressure;
+						bool is_eraser = xfc->pens[i].is_eraser;
+						xf_input_pen_remote(xfc, cookie.cc->data, cookie.cc->evtype, max_pressure, is_eraser);
+						used = TRUE;
+						break;
+					}
+				}
+				if (used)
+					break;
+			}
 			default:
 				xf_input_event(xfc, event, cookie.cc->data, cookie.cc->evtype);
 				break;
