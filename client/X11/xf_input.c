@@ -78,6 +78,10 @@ typedef struct pen_device
 	int deviceid;
 	BOOL is_eraser;
 	double max_pressure;
+	int hovering;
+	int pressed;
+	int last_x;
+	int last_y;
 } penDevice;
 
 static penDevice pens[MAX_PENS];
@@ -221,6 +225,8 @@ int xf_input_init(xfContext* xfc, Window window)
 						pens[num_pens].deviceid = dev->deviceid;
 						pens[num_pens].is_eraser = FALSE;
 						pens[num_pens].max_pressure = max_pressure;
+						pens[num_pens].hovering = FALSE;
+						pens[num_pens].pressed = FALSE;
 						num_pens++;
 						WLog_DBG(TAG, "registered pen");
 					}
@@ -229,6 +235,8 @@ int xf_input_init(xfContext* xfc, Window window)
 						pens[num_pens].deviceid = dev->deviceid;
 						pens[num_pens].is_eraser = TRUE;
 						pens[num_pens].max_pressure = max_pressure;
+						pens[num_pens].hovering = FALSE;
+						pens[num_pens].pressed = FALSE;
 						num_pens++;
 						WLog_DBG(TAG, "registered eraser");
 					}
@@ -625,7 +633,7 @@ static int xf_input_touch_remote(xfContext* xfc, XIDeviceEvent* event, int evtyp
 	return 0;
 }
 
-static int xf_input_pen_remote(xfContext* xfc, XIDeviceEvent* event, int evtype, double max_pressure, BOOL is_eraser, int pen_index)
+static int xf_input_pen_remote(xfContext* xfc, XIDeviceEvent* event, int evtype, int pen_index)
 {
 	int x, y;
 	int touchId;
@@ -654,28 +662,61 @@ static int xf_input_pen_remote(xfContext* xfc, XIDeviceEvent* event, int evtype,
 	}
 	WLog_DBG(TAG, "pen pressure %f", pressure);
 	// [MS-RDPEI] 2.2.3.7.1.1: This value MUST be normalized in the range 0x00000000 to 0x00000400 (1024), inclusive
-	pressure = pressure / max_pressure * 1024;
+	pressure = pressure / pens[pen_index].max_pressure * 1024;
 
 	const UINT32 fieldFlags = PEN_CONTACT_PENFLAGS_PRESENT | PEN_CONTACT_PRESSURE_PRESENT;
-	const UINT32 penFlags = is_eraser ? PEN_FLAG_INVERTED : 0;
+	const UINT32 penFlags = pens[pen_index].is_eraser ? PEN_FLAG_INVERTED : 0;
 	const UINT32 penPressure = (UINT32)pressure;
 	switch (evtype)
 	{
 		case XI_ButtonPress:
+			pens[pen_index].hovering = FALSE;
+			pens[pen_index].pressed = TRUE;
 			rdpei->PenBegin(rdpei, pen_index, fieldFlags, x, y, penFlags, penPressure);
 			break;
 		case XI_Motion:
-			rdpei->PenUpdate(rdpei, pen_index, fieldFlags, x, y, penFlags, penPressure);
+			if (pens[pen_index].pressed)
+			{
+				rdpei->PenUpdate(rdpei, pen_index, fieldFlags, x, y, penFlags, penPressure);
+			}
+			else if (pens[pen_index].hovering)
+			{
+				rdpei->PenHoverUpdate(rdpei, pen_index, fieldFlags, x, y, penFlags, penPressure);
+			}
+			else
+			{
+				pens[pen_index].hovering = TRUE;
+				rdpei->PenHoverBegin(rdpei, pen_index, fieldFlags, x, y, penFlags, penPressure);
+			}
 			break;
 		case XI_ButtonRelease:
+			pens[pen_index].pressed = FALSE;
+			pens[pen_index].hovering = TRUE;
 			//rdpei->PenEnd(rdpei, pen_index, fieldFlags, x, y, penFlags, penPressure);
 			rdpei->PenEnd(rdpei, pen_index, 0, x, y);
 			break;
 		default:
 			break;
 	}
-
+	pens[pen_index].last_x = x;
+	pens[pen_index].last_y = y;
 	return 0;
+}
+
+static int xf_input_pens_unhover(xfContext* xfc)
+{
+	RdpeiClientContext* rdpei = xfc->rdpei;
+	if (!rdpei)
+		return 0;
+		
+	for (int i = 0; i < num_pens; i++)
+	{
+		if (pens[i].hovering)
+		{
+			pens[i].hovering = FALSE;
+			rdpei->PenHoverCancel(rdpei, i, 0, pens[i].last_x, pens[i].last_y);
+		}
+	}
 }
 
 static int xf_input_event(xfContext* xfc, XIDeviceEvent* event, int evtype)
@@ -717,6 +758,7 @@ static int xf_input_handle_event_remote(xfContext* xfc, const XEvent* event)
 		switch (cookie.cc->evtype)
 		{
 			case XI_TouchBegin:
+				xf_input_pens_unhover(xfc);
 				xf_input_touch_remote(xfc, cookie.cc->data, XI_TouchBegin);
 				break;
 
@@ -740,15 +782,15 @@ static int xf_input_handle_event_remote(xfContext* xfc, const XEvent* event)
 					if (pens[i].deviceid == deviceid)
 					{
 						WLog_DBG(TAG, "pen found");
-						int max_pressure = pens[i].max_pressure;
-						BOOL is_eraser = pens[i].is_eraser;
-						xf_input_pen_remote(xfc, cookie.cc->data, cookie.cc->evtype, max_pressure, is_eraser, i);
+						xf_input_pen_remote(xfc, cookie.cc->data, cookie.cc->evtype, i);
 						used = TRUE;
 						break;
 					}
 				}
 				if (used)
 					break;
+				else
+					xf_input_pens_unhover(xfc);
 			}
 			default:
 				xf_input_event(xfc, cookie.cc->data, cookie.cc->evtype);
