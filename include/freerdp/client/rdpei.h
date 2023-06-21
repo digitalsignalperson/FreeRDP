@@ -73,6 +73,9 @@ struct _rdpei_client_context
 	pcRdpeiPen PenBegin;
 	pcRdpeiPen PenUpdate;
 	pcRdpeiPen PenEnd;
+	pcRdpeiPen PenHoverBegin;
+	pcRdpeiPen PenHoverUpdate;
+	pcRdpeiPen PenHoverCancel;
 };
 
 #endif /* FREERDP_CHANNEL_RDPEI_CLIENT_RDPEI_H */

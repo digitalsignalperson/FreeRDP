@@ -43,6 +43,7 @@
 #ifdef WITH_XI
 
 #define MAX_CONTACTS 2
+#define MAX_PENS 4
 
 #define PAN_THRESHOLD 50
 #define ZOOM_THRESHOLD 10
@@ -71,6 +72,20 @@ static double lastDist;
 static double z_vector;
 static double px_vector;
 static double py_vector;
+
+typedef struct pen_device
+{
+	int deviceid;
+	BOOL is_eraser;
+	double max_pressure;
+	int hovering;
+	int pressed;
+	int last_x;
+	int last_y;
+} penDevice;
+
+static penDevice pens[MAX_PENS];
+static int num_pens;
 
 const char* xf_input_get_class_string(int class)
 {
@@ -106,6 +121,7 @@ int xf_input_init(xfContext* xfc, Window window)
 	nmasks = 0;
 	ndevices = 0;
 	active_contacts = 0;
+	num_pens = 0;
 	ZeroMemory(contacts, sizeof(touchContact) * MAX_CONTACTS);
 
 	if (!XQueryExtension(xfc->display, "XInputExtension", &opcode, &event, &error))
@@ -188,6 +204,41 @@ int xf_input_init(xfContext* xfc, Window window)
 					XISetMask(masks[nmasks], XI_ButtonRelease);
 					XISetMask(masks[nmasks], XI_Motion);
 					nmasks++;
+				}
+			}
+
+			if (class->type == XIValuatorClass)
+			{
+				const XIValuatorClassInfo* t = (const XIValuatorClassInfo*)class;
+				char* name = t->label ? XGetAtomName(xfc->display, t->label) : NULL;
+
+				WLog_DBG(TAG, "%s device (id: %d) valuator %d label %s range %f - %f", dev->name,
+				         dev->deviceid, t->number, name ? name : "None", t->min, t->max);
+
+				// if (strstr(name, "Pressure"))
+				if (t->number == 2) // other implementations always go by index. would name be better?
+				{
+					double max_pressure = t->max;
+					if (strstr(dev->name, "Stylus Pen") || strstr(dev->name, "Pen Pen"))
+					{
+						pens[num_pens].deviceid = dev->deviceid;
+						pens[num_pens].is_eraser = FALSE;
+						pens[num_pens].max_pressure = max_pressure;
+						pens[num_pens].hovering = FALSE;
+						pens[num_pens].pressed = FALSE;
+						num_pens++;
+						WLog_DBG(TAG, "registered pen");
+					}
+					else if (strstr(dev->name, "Stylus Eraser") || strstr(dev->name, "Pen Eraser"))
+					{
+						pens[num_pens].deviceid = dev->deviceid;
+						pens[num_pens].is_eraser = TRUE;
+						pens[num_pens].max_pressure = max_pressure;
+						pens[num_pens].hovering = FALSE;
+						pens[num_pens].pressed = FALSE;
+						num_pens++;
+						WLog_DBG(TAG, "registered eraser");
+					}
 				}
 			}
 		}
@@ -581,6 +632,96 @@ static int xf_input_touch_remote(xfContext* xfc, XIDeviceEvent* event, int evtyp
 	return 0;
 }
 
+static int xf_input_pen_remote(xfContext* xfc, XIDeviceEvent* event, int evtype, int pen_index)
+{
+	int x, y;
+	int contactId;
+	RdpeiClientContext* rdpei = xfc->rdpei;
+
+	if (!rdpei)
+		return 0;
+
+	xf_input_hide_cursor(xfc);
+	x = (int)event->event_x;
+	y = (int)event->event_y;
+	xf_event_adjust_coordinates(xfc, &x, &y);
+
+	double pressure = 0.0;
+	double* val = event->valuators.values;
+	for (int i = 0; i < MIN(event->valuators.mask_len * 8, 3); i++)
+	{
+		if (XIMaskIsSet(event->valuators.mask, i))
+		{
+			double value = *val++;
+			if (i == 2)
+				pressure = value;
+		}
+	}
+	WLog_DBG(TAG, "pen pressure %f", pressure);
+	// [MS-RDPEI] 2.2.3.7.1.1: This value MUST be normalized in the range 0x00000000 to 0x00000400 (1024), inclusive
+	pressure = pressure / pens[pen_index].max_pressure * 1024;
+
+	const UINT32 fieldFlags = PEN_CONTACT_PENFLAGS_PRESENT | PEN_CONTACT_PRESSURE_PRESENT;
+	const UINT32 penFlags = pens[pen_index].is_eraser ? PEN_FLAG_INVERTED : 0;
+	const UINT32 penPressure = (UINT32)pressure;
+	switch (evtype)
+	{
+		case XI_ButtonPress:
+			WLog_DBG(TAG, "Pen press %d", pen_index);
+			pens[pen_index].hovering = FALSE;
+			pens[pen_index].pressed = TRUE;
+			rdpei->PenBegin(rdpei, pen_index, fieldFlags, x, y, penFlags, penPressure);
+			break;
+		case XI_Motion:
+			if (pens[pen_index].pressed)
+			{
+				WLog_DBG(TAG, "Pen update %d", pen_index);
+				rdpei->PenUpdate(rdpei, pen_index, fieldFlags, x, y, penFlags, penPressure);
+			}
+			else if (pens[pen_index].hovering)
+			{
+				WLog_DBG(TAG, "Pen hover update %d", pen_index);
+				rdpei->PenHoverUpdate(rdpei, pen_index, PEN_CONTACT_PENFLAGS_PRESENT, x, y, penFlags);
+			}
+			else if (pens[pen_index].last_x != x && pens[pen_index].last_y != y)
+			{
+				WLog_DBG(TAG, "Pen hover begin %d", pen_index);
+				pens[pen_index].hovering = TRUE;
+				rdpei->PenHoverBegin(rdpei, pen_index, PEN_CONTACT_PENFLAGS_PRESENT, x, y, penFlags);
+			}
+			break;
+		case XI_ButtonRelease:
+			WLog_DBG(TAG, "Pen release %d", pen_index);
+			pens[pen_index].pressed = FALSE;
+			rdpei->PenUpdate(rdpei, pen_index, fieldFlags, x, y, penFlags, penPressure);
+			rdpei->PenEnd(rdpei, pen_index, PEN_CONTACT_PENFLAGS_PRESENT, x, y, penFlags);
+			rdpei->PenHoverCancel(rdpei, pen_index, PEN_CONTACT_PENFLAGS_PRESENT, x, y, penFlags);
+			break;
+		default:
+			break;
+	}
+	pens[pen_index].last_x = x;
+	pens[pen_index].last_y = y;
+	return 0;
+}
+
+static int xf_input_pens_unhover(xfContext* xfc)
+{
+	RdpeiClientContext* rdpei = xfc->rdpei;
+	if (!rdpei)
+		return 0;
+
+	for (int i = 0; i < num_pens; i++)
+	{
+		if (pens[i].hovering)
+		{
+			WLog_DBG(TAG, "unhover pen %d", i);
+			pens[i].hovering = FALSE;
+			rdpei->PenHoverCancel(rdpei, i, 0, pens[i].last_x, pens[i].last_y);
+		}
+	}
+}
+
 static int xf_input_event(xfContext* xfc, XIDeviceEvent* event, int evtype)
 {
 	xf_input_show_cursor(xfc);
@@ -620,9 +761,9 @@ static int xf_input_handle_event_remote(xfContext* xfc, const XEvent* event)
 		switch (cookie.cc->evtype)
 		{
 			case XI_TouchBegin:
+				xf_input_pens_unhover(xfc);
 				xf_input_touch_remote(xfc, cookie.cc->data, XI_TouchBegin);
 				break;
-
 			case XI_TouchUpdate:
 				xf_input_touch_remote(xfc, cookie.cc->data, XI_TouchUpdate);
 				break;
@@ -630,8 +771,29 @@ static int xf_input_handle_event_remote(xfContext* xfc, const XEvent* event)
 			case XI_TouchEnd:
 				xf_input_touch_remote(xfc, cookie.cc->data, XI_TouchEnd);
 				break;
-
+			case XI_ButtonPress:
+			case XI_Motion:
+			case XI_ButtonRelease:
+			{
+				WLog_DBG(TAG, "checking for pen");
+				XIDeviceEvent* deviceEvent = (XIDeviceEvent*)cookie.cc->data;
+				int deviceid = deviceEvent->deviceid;
+				BOOL used = FALSE;
+				for (int i = 0; i < num_pens; i++)
+				{
+					if (pens[i].deviceid == deviceid)
+					{
+						WLog_DBG(TAG, "pen found, is_eraser=%d", pens[i].is_eraser);
+						xf_input_pen_remote(xfc, cookie.cc->data, cookie.cc->evtype, i);
+						used = TRUE;
+						break;
+					}
+				}
+				if (used)
+					break;
+			}
 			default:
+				xf_input_pens_unhover(xfc);
 				xf_input_event(xfc, cookie.cc->data, cookie.cc->evtype);
 				break;
 		}
