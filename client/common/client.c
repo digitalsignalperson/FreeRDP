@@ -1489,10 +1489,10 @@ static BOOL freerdp_handle_touch_up(rdpClientContext* cctx, const FreeRDP_TouchC
 	return TRUE;
 }
 
-static BOOL freerdp_handle_touch_down(rdpClientContext* cctx, const FreeRDP_TouchContact* contact)
+static BOOL freerdp_handle_touch_down(rdpClientContext* cctx, UINT32 flags, INT32 finger,
+                                 UINT32 pressure, INT32 x, INT32 y)
 {
 	WINPR_ASSERT(cctx);
-	WINPR_ASSERT(contact);
 
 #if defined(CHANNEL_RDPEI_CLIENT)
 	RdpeiClientContext* rdpei = cctx->rdpei;
@@ -1505,9 +1505,9 @@ static BOOL freerdp_handle_touch_down(rdpClientContext* cctx, const FreeRDP_Touc
 		flags |= PTR_FLAGS_MOVE;
 		flags |= PTR_FLAGS_BUTTON1;
 
-		WINPR_ASSERT(contact->x <= UINT16_MAX);
-		WINPR_ASSERT(contact->y <= UINT16_MAX);
-		return freerdp_client_send_button_event(cctx, FALSE, flags, contact->x, contact->y);
+		WINPR_ASSERT(x <= UINT16_MAX);
+		WINPR_ASSERT(y <= UINT16_MAX);
+		return freerdp_client_send_button_event(cctx, FALSE, flags, x, y);
 	}
 	else
 	{
@@ -1515,17 +1515,18 @@ static BOOL freerdp_handle_touch_down(rdpClientContext* cctx, const FreeRDP_Touc
 
 		if (rdpei->TouchRawEvent)
 		{
-			const UINT32 flags = RDPINPUT_CONTACT_FLAG_DOWN;
-			const UINT32 contactFlags = ((contact->flags & FREERDP_TOUCH_HAS_PRESSURE) != 0)
+			WLog_DBG(TAG, "client handle touch down raw");
+			const UINT32 flags = RDPINPUT_CONTACT_FLAG_DOWN | RDPINPUT_CONTACT_FLAG_INRANGE | RDPINPUT_CONTACT_FLAG_INCONTACT;
+			const UINT32 contactFlags = ((flags & FREERDP_TOUCH_HAS_PRESSURE) != 0)
 			                                ? CONTACT_DATA_PRESSURE_PRESENT
 			                                : 0;
-			rdpei->TouchRawEvent(rdpei, contact->id, contact->x, contact->y, &contactId, flags,
-			                     contactFlags, contact->pressure);
+			rdpei->TouchRawEvent(rdpei, finger, x, y, &contactId, flags,
+			                     contactFlags, pressure);
 		}
 		else
 		{
 			WINPR_ASSERT(rdpei->TouchBegin);
-			rdpei->TouchBegin(rdpei, contact->id, contact->x, contact->y, &contactId);
+			rdpei->TouchBegin(rdpei, finger, x, y, &contactId);
 		}
 	}
 #else
@@ -1559,7 +1560,7 @@ static BOOL freerdp_handle_touch_motion(rdpClientContext* cctx, const FreeRDP_To
 
 		if (rdpei->TouchRawEvent)
 		{
-			const UINT32 flags = RDPINPUT_CONTACT_FLAG_UPDATE;
+			const UINT32 flags = RDPINPUT_CONTACT_FLAG_UPDATE | RDPINPUT_CONTACT_FLAG_INRANGE | RDPINPUT_CONTACT_FLAG_INCONTACT;
 			const UINT32 contactFlags = ((contact->flags & FREERDP_TOUCH_HAS_PRESSURE) != 0)
 			                                ? CONTACT_DATA_PRESSURE_PRESENT
 			                                : 0;
@@ -1612,17 +1613,23 @@ BOOL freerdp_client_handle_touch(rdpClientContext* cctx, UINT32 flags, INT32 fin
 	WINPR_ASSERT(cctx);
 
 	const FreeRDP_TouchContact* contact = NULL;
+	WLog_DBG(TAG, "client handle touch %d, %d, %d, %d, %d", flags, finger, pressure, x, y);
 
-	if (!freerdp_client_touch_update(cctx, flags, finger, pressure, x, y, &contact))
+	if (!(flags & FREERDP_TOUCH_DOWN) && !freerdp_client_touch_update(cctx, flags, finger, pressure, x, y, &contact)) {
+		WLog_ERR(TAG, "no contact point");
 		return FALSE;
+	}
 
 	switch (flags)
 	{
 		case FREERDP_TOUCH_DOWN:
-			return freerdp_handle_touch_down(cctx, contact);
+			WLog_DBG(TAG, "client handle touch down");
+			return freerdp_handle_touch_down(cctx, flags, finger, pressure, x, y);
 		case FREERDP_TOUCH_UP:
+			WLog_DBG(TAG, "client handle touch up");
 			return freerdp_handle_touch_up(cctx, contact);
 		case FREERDP_TOUCH_MOTION:
+			WLog_DBG(TAG, "client handle touch motion");
 			return freerdp_handle_touch_motion(cctx, contact);
 		default:
 			WLog_WARN(TAG, "Unhandled FreeRDPTouchEventType %d, ignoring", flags);
